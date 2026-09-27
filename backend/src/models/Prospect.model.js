@@ -68,8 +68,14 @@ const prospectSchema = new mongoose.Schema({
   }
 });
 
-// Compound index for deduplication
-prospectSchema.index({ campaign: 1, domain: 1 }, { unique: true });
+// Compound index for deduplication.
+// IMPORTANT: this replaces the old { campaign, domain } unique index.
+// A domain can now have many Prospect documents — one per distinct email
+// address found for it — and duplicates are prevented per (domain, email)
+// pair instead of collapsing the whole domain into a single row. Two rows
+// with the same domain and no email (email: null) still collide, so a
+// domain with genuinely no address found is still only stored once.
+prospectSchema.index({ campaign: 1, domain: 1, email: 1 }, { unique: true });
 prospectSchema.index({ campaign: 1, emailStatus: 1 });
 prospectSchema.index({ emailStatus: 1, nextRetryAt: 1 });
 
