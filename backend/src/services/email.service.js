@@ -65,6 +65,15 @@ To stop receiving emails like this, reply with "unsubscribe" in the subject line
   }
 };
 
+// Default recipient/sender data — matches the EditorWorld outreach example.
+// Pass your own `data` object into personalizeEmail() to override any of these per-send.
+const defaultData = {
+  siteName: 'editorworld.com',
+  domain: 'editorworld.com',
+  niche: 'your industry',
+  senderName: 'Mahmood Uppal'
+};
+
 // Create transporter for a user
 function createTransporter(gmailUser, gmailAppPassword) {
   return nodemailer.createTransport({
@@ -83,14 +92,14 @@ function createTransporter(gmailUser, gmailAppPassword) {
 }
 
 // Replace template variables
-function personalizeEmail(template, data) {
+function personalizeEmail(template, data = {}) {
   let result = template;
-  
+
   const variables = {
-    site_name: data.siteName || data.domain || 'your site',
-    domain: data.domain || '',
-    niche: data.niche || 'your industry',
-    sender_name: data.senderName || 'An SEO Specialist',
+    site_name: data.siteName || data.domain || defaultData.siteName,
+    domain: data.domain || defaultData.domain,
+    niche: data.niche || defaultData.niche,
+    sender_name: data.senderName || defaultData.senderName,
     ...data
   };
 
@@ -170,8 +179,18 @@ function checkDeliverabilityRisks(subject, body) {
 
 module.exports = {
   defaultTemplates,
+  defaultData,
   createTransporter,
   personalizeEmail,
   sendEmail,
   checkDeliverabilityRisks
 };
+
+// --- Example usage, producing the exact EditorWorld message ---
+// const { defaultTemplates, personalizeEmail } = require('./outreach_mailer');
+//
+// const subject = personalizeEmail(defaultTemplates.guestPost.subject, {});
+// const text = personalizeEmail(defaultTemplates.guestPost.textBody, {});
+//
+// console.log(subject); // "Collaboration Opportunity with editorworld.com"
+// console.log(text);    // the exact message you posted, with editorworld.com / Mahmood Uppal filled in
