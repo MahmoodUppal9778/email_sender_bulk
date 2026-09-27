@@ -1,7 +1,6 @@
 const express = require('express');
 const multer = require('multer');
 const xlsx = require('xlsx');
-const validator = require('validator');
 const Campaign = require('../models/Campaign.model');
 const Prospect = require('../models/Prospect.model');
 const authMiddleware = require('../middleware/auth.middleware');
@@ -56,6 +55,32 @@ function normalizeUrl(url) {
   }
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Pulls EVERY valid email out of a cell, not just a single one. Cells often
+// contain multiple addresses separated by ";" or "," (e.g.
+// "submissions@site.com; pauline@site.com") — the old code validated the
+// whole cell as ONE email and silently dropped everything when it wasn't,
+// which is why multi-email rows were showing up as "Not found".
+function extractEmails(rawCell) {
+  if (!rawCell) return [];
+
+  const candidates = String(rawCell)
+    .split(/[;,]/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  const seen = new Set();
+  const valid = [];
+  for (const candidate of candidates) {
+    if (EMAIL_RE.test(candidate) && !seen.has(candidate)) {
+      seen.add(candidate);
+      valid.push(candidate);
+    }
+  }
+  return valid;
+}
+
 // Parse uploaded file
 function parseFile(buffer, filename) {
   const workbook = xlsx.read(buffer, { type: 'buffer' });
@@ -81,7 +106,10 @@ function parseFile(buffer, filename) {
   }
 
   const prospects = [];
-  const seenDomains = new Set();
+  // Dedupe within THIS file only, keyed on (domain + email) — not domain
+  // alone — so a domain with 20 addresses produces 20 drafts, while an
+  // exact repeat of the same domain+email pair within the file is skipped.
+  const seenPairs = new Set();
 
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
@@ -91,20 +119,41 @@ function parseFile(buffer, filename) {
     if (!websiteUrl) continue;
 
     const domain = extractDomain(websiteUrl);
-    if (!domain || seenDomains.has(domain)) continue;
+    if (!domain) continue;
 
-    let email = emailColIndex >= 0 ? row[emailColIndex] : null;
-    if (email && !validator.isEmail(String(email).trim())) {
-      email = null;
+    const emails = emailColIndex >= 0 ? extractEmails(row[emailColIndex]) : [];
+
+    if (emails.length === 0) {
+      // No valid email found for this row — still track the domain (as
+      // "Not found") so it shows up and can be scraped later, but only
+      // once per domain.
+      const key = `${domain}|`;
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+
+      prospects.push({
+        websiteUrl,
+        domain,
+        email: null,
+        emailSource: null
+      });
+      continue;
     }
 
-    seenDomains.add(domain);
-    prospects.push({
-      websiteUrl,
-      domain,
-      email: email ? String(email).trim().toLowerCase() : null,
-      emailSource: email ? 'uploaded' : null
-    });
+    // One prospect draft per email found — this is what makes every
+    // address in a multi-email cell actually contactable.
+    for (const email of emails) {
+      const key = `${domain}|${email}`;
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+
+      prospects.push({
+        websiteUrl,
+        domain,
+        email,
+        emailSource: 'uploaded'
+      });
+    }
   }
 
   return prospects;
@@ -142,16 +191,27 @@ router.post('/:campaignId', authMiddleware, upload.single('file'), async (req, r
       });
     }
 
-    // Get existing domains in campaign
-    const existingDomains = await Prospect.distinct('domain', { campaign: campaign._id });
-    const existingSet = new Set(existingDomains);
+    // Dedupe against what's already in the DB by (domain, email) — NOT by
+    // domain alone — so a domain that already has 2 of its 5 emails saved
+    // still gets the other 3 inserted instead of being skipped entirely.
+    const existingProspects = await Prospect.find(
+      { campaign: campaign._id },
+      { domain: 1, email: 1 }
+    ).lean();
+    const existingPairs = new Set(
+      existingProspects.map(p => `${p.domain}|${p.email || ''}`)
+    );
 
-    // Filter out duplicates
-    const newProspects = prospects.filter(p => !existingSet.has(p.domain));
+    const newProspects = prospects.filter(
+      p => !existingPairs.has(`${p.domain}|${p.email || ''}`)
+    );
 
-    // Insert new prospects
+    // Insert new prospects. The unique (campaign, domain, email) index on
+    // the model is the real source of truth for dedupe — insertMany with
+    // ordered:false still inserts every non-conflicting doc even if a race
+    // or an in-file edge case slips one duplicate through.
     let inserted = 0;
-    let skipped = prospects.length - newProspects.length;
+    const skipped = prospects.length - newProspects.length;
 
     if (newProspects.length > 0) {
       const docs = newProspects.map(p => ({
@@ -160,12 +220,15 @@ router.post('/:campaignId', authMiddleware, upload.single('file'), async (req, r
         user: req.user._id
       }));
 
-      await Prospect.insertMany(docs, { ordered: false }).catch(err => {
-        // Handle duplicate key errors gracefully
-        if (err.code !== 11000) throw err;
-      });
-
-      inserted = newProspects.length;
+      try {
+        const result = await Prospect.insertMany(docs, { ordered: false });
+        inserted = result.length;
+      } catch (err) {
+        // Some docs can still fail on a duplicate key race; count only
+        // what actually made it into the DB rather than assuming success.
+        if (err.code !== 11000 && err.code !== undefined) throw err;
+        inserted = err.insertedDocs ? err.insertedDocs.length : 0;
+      }
     }
 
     // Update campaign stats
